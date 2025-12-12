@@ -28,7 +28,7 @@ jobs:
   test:
     name: E2E Tests
     runs-on: ubuntu-24.04
-    needs: lint
+    # needs: lint
     services:
       minio:
         image: minio/minio
