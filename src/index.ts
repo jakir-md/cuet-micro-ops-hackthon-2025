@@ -392,7 +392,7 @@ async function processDownloadInBackground(jobId: string, fileIds: number[]) {
   try {
     // 1. Simulate Variable Processing Time (10s - 120s typically)
     const delay = getRandomDelay();
-    console.log(`[Job ${jobId}] Simulating work for ${delay}ms`);
+    console.log(`[Job ${jobId}] Simulating work for ${String(delay)}ms`);
 
     // Simulate progress steps
     const steps = 10;
@@ -400,7 +400,7 @@ async function processDownloadInBackground(jobId: string, fileIds: number[]) {
     
     for(let i = 1; i <= steps; i++) {
         await sleep(stepDelay);
-        if(job) job.progress = i * 10;
+        job.progress = i * 10;
     }
 
     // 2. Upload Dummy File to MinIO (Challenge 1)
@@ -637,7 +637,7 @@ app.openapi(downloadInitiateRoute, (c) => {
   });
 
   // 2. Trigger Background Worker (Fire & Forget)
-  processDownloadInBackground(jobId, file_ids);
+  void processDownloadInBackground(jobId, file_ids);
 
   // 3. Return Immediate Response
   return c.json(
