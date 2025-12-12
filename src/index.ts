@@ -1,4 +1,4 @@
-import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
 import { httpInstrumentationMiddleware } from "@hono/otel";
@@ -13,6 +13,23 @@ import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { timeout } from "hono/timeout";
 import { rateLimiter } from "hono-rate-limiter";
+
+// --- [NEW] IN-MEMORY JOB STORE (Challenge 2) ---
+// We add this at the top level to track state across requests
+type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
+
+interface Job {
+  jobId: string;
+  fileIds: number[];
+  status: JobStatus;
+  progress: number;
+  downloadUrl?: string;
+  error?: string;
+  createdAt: number;
+}
+
+const jobs = new Map<string, Job>();
+// ------------------------------------------------
 
 // Helper for optional URL that treats empty string as undefined
 const optionalUrl = z
@@ -75,6 +92,27 @@ const otelSDK = new NodeSDK({
 otelSDK.start();
 
 const app = new OpenAPIHono();
+
+app.use(
+  cors({
+    origin: env.CORS_ORIGINS,
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization", "X-Request-ID"],
+    // ...
+  }),
+)
+
+app.use(
+  '*', 
+  cors({
+    origin: '*', // Allow any frontend
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+    exposeHeaders: ['Content-Length', 'X-Request-ID'],
+    maxAge: 600,
+    credentials: true,
+  })
+);
 
 // Request ID middleware - adds unique ID to each request
 app.use(async (c, next) => {
@@ -252,6 +290,19 @@ const DownloadStartResponseSchema = z
   })
   .openapi("DownloadStartResponse");
 
+// --- [NEW] CHALLENGE 2 SCHEMA (For Polling) ---
+const JobStatusResponseSchema = z
+  .object({
+    jobId: z.string(),
+    status: z.enum(["queued", "processing", "completed", "failed"]),
+    progress: z.number().int(),
+    downloadUrl: z.string().optional(),
+    error: z.string().optional(),
+  })
+  .openapi("JobStatusResponse");
+// ---------------------------------------------
+
+
 // Input sanitization for S3 keys - prevent path traversal
 const sanitizeS3Key = (fileId: number): string => {
   // Ensure fileId is a valid integer within bounds (already validated by Zod)
@@ -330,6 +381,59 @@ const getRandomDelay = (): number => {
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+// --- [NEW] BACKGROUND WORKER (Challenge 2 Logic) ---
+async function processDownloadInBackground(jobId: string, fileIds: number[]) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  console.log(`[Job ${jobId}] Background processing started for files: ${fileIds.join(', ')}`);
+  job.status = 'processing';
+  
+  try {
+    // 1. Simulate Variable Processing Time (10s - 120s typically)
+    const delay = getRandomDelay();
+    console.log(`[Job ${jobId}] Simulating work for ${delay}ms`);
+
+    // Simulate progress steps
+    const steps = 10;
+    const stepDelay = delay / steps;
+    
+    for(let i = 1; i <= steps; i++) {
+        await sleep(stepDelay);
+        if(job) job.progress = i * 10;
+    }
+
+    // 2. Upload Dummy File to MinIO (Challenge 1)
+    // We generate content dynamically
+    const fileContent = `Processed content for job ${jobId}. Files included: ${fileIds.join(', ')}`;
+    const s3Key = `processed/${jobId}.txt`;
+    
+    if (env.S3_BUCKET_NAME) {
+        await s3Client.send(new PutObjectCommand({
+            Bucket: env.S3_BUCKET_NAME,
+            Key: s3Key,
+            Body: fileContent,
+            ContentType: 'text/plain'
+        }));
+    }
+
+    // 3. Mark Complete
+    job.status = 'completed';
+    job.progress = 100;
+    // In production this would be a presigned URL. For now, direct link to MinIO.
+    job.downloadUrl = `http://localhost:9000/${env.S3_BUCKET_NAME}/${s3Key}`;
+    
+    console.log(`[Job ${jobId}] Completed successfully. URL: ${job.downloadUrl}`);
+
+  } catch (err) {
+    console.error(`[Job ${jobId}] Failed:`, err);
+    job.status = 'failed';
+    job.error = 'Processing failed internally';
+  }
+}
+// ----------------------------------------------------
+
+
 // Routes
 const rootRoute = createRoute({
   method: "get",
@@ -399,8 +503,8 @@ const downloadInitiateRoute = createRoute({
   method: "post",
   path: "/v1/download/initiate",
   tags: ["Download"],
-  summary: "Initiate download job",
-  description: "Initiates a download job for multiple IDs",
+  summary: "Initiate download job (Async)",
+  description: "Initiates a background download job to avoid timeouts. Returns immediately.",
   request: {
     body: {
       content: {
@@ -411,7 +515,7 @@ const downloadInitiateRoute = createRoute({
     },
   },
   responses: {
-    200: {
+    202: { // Changed to 202 Accepted for Async Pattern
       description: "Download job initiated",
       content: {
         "application/json": {
@@ -437,6 +541,36 @@ const downloadInitiateRoute = createRoute({
     },
   },
 });
+
+// --- [NEW] STATUS CHECK ROUTE (Challenge 2) ---
+const downloadStatusRoute = createRoute({
+  method: "get",
+  path: "/v1/download/status/{jobId}",
+  tags: ["Download"],
+  summary: "Check Job Status",
+  description: "Poll this endpoint to get the status of a background download job.",
+  request: {
+    params: z.object({
+      jobId: z.string().openapi({ description: "The Job ID returned from initiate" })
+    })
+  },
+  responses: {
+    200: {
+      description: "Current Job Status",
+      content: {
+        "application/json": {
+          schema: JobStatusResponseSchema,
+        },
+      },
+    },
+    404: {
+      description: "Job not found",
+      content: { "application/json": { schema: ErrorResponseSchema } }
+    }
+  },
+});
+// ----------------------------------------------
+
 
 const downloadCheckRoute = createRoute({
   method: "post",
@@ -488,18 +622,57 @@ const downloadCheckRoute = createRoute({
   },
 });
 
+// --- UPDATED HANDLER FOR INITIATE (Async) ---
 app.openapi(downloadInitiateRoute, (c) => {
   const { file_ids } = c.req.valid("json");
   const jobId = crypto.randomUUID();
+  
+  // 1. Create Job Entry
+  jobs.set(jobId, {
+    jobId,
+    fileIds: file_ids,
+    status: 'queued',
+    progress: 0,
+    createdAt: Date.now()
+  });
+
+  // 2. Trigger Background Worker (Fire & Forget)
+  processDownloadInBackground(jobId, file_ids);
+
+  // 3. Return Immediate Response
   return c.json(
     {
       jobId,
       status: "queued" as const,
       totalFileIds: file_ids.length,
+      message: "Download started in background. Poll /v1/download/status/:jobId"
     },
-    200,
+    202, // 202 Accepted
   );
 });
+
+// --- NEW HANDLER FOR STATUS ---
+app.openapi(downloadStatusRoute, (c) => {
+  const jobId = c.req.param("jobId");
+  const job = jobs.get(jobId);
+
+  if (!job) {
+    return c.json({ 
+      error: "Job Not Found", 
+      message: "The requested job ID does not exist or has expired.",
+      requestId: c.get("requestId")
+    }, 404);
+  }
+
+  return c.json({
+    jobId: job.jobId,
+    status: job.status,
+    progress: job.progress,
+    downloadUrl: job.downloadUrl,
+    error: job.error
+  }, 200);
+});
+
 
 app.openapi(downloadCheckRoute, async (c) => {
   const { sentry_test } = c.req.valid("query");
