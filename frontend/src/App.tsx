@@ -3,7 +3,7 @@ import axios from 'axios'
 import { Activity, Download, AlertCircle, CheckCircle, Loader2 } from 'lucide-react'
 
 // --- CONFIG ---
-const API_URL = 'http://localhost:3000'
+const API_URL = 'http://36.255.70.199:3000'
 
 interface Job {
   jobId: string
